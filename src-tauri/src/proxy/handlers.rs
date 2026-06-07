@@ -18,7 +18,7 @@ use super::{
     providers::{
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
-        streaming_codex_chat::create_responses_sse_stream_from_chat,
+        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
         transform_codex_chat, transform_gemini, transform_responses,
@@ -60,6 +60,41 @@ pub async fn health_check() -> (StatusCode, Json<Value>) {
 pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxyStatus>, ProxyError> {
     let status = state.status.read().await.clone();
     Ok(Json(status))
+}
+
+/// GET /v1/models — Codex model list (reachability check)
+///
+/// Codex CLI probes this endpoint at startup and deserializes the response as a
+/// catalog with a top-level `models` field.  Return the cc-switch–managed model
+/// catalog file directly so the format always matches what the current version
+/// of Codex expects.
+///
+/// Only serves the catalog when the live config.toml still references the
+/// cc-switch–owned `model_catalog_json`, using the same path ownership rules as
+/// Codex live-setting import.
+pub async fn handle_models() -> Result<Json<Value>, ProxyError> {
+    let generated_path = crate::codex_config::get_codex_model_catalog_path();
+    let active_catalog_path = match crate::codex_config::read_codex_config_text() {
+        Ok(config_text) => {
+            crate::codex_config::resolve_cc_switch_catalog_path(&config_text, &generated_path)
+        }
+        Err(_) => None,
+    };
+
+    let catalog = if let Some(catalog_path) =
+        active_catalog_path.as_ref().filter(|path| path.exists())
+    {
+        let text = std::fs::read_to_string(catalog_path).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or(json!({"models": []}))
+    } else {
+        if active_catalog_path.is_none() {
+            log::debug!(
+                "[models] stale guard: catalog not served (model_catalog_json not set to cc-switch catalog)"
+            );
+        }
+        json!({"models": []})
+    };
+    Ok(Json(catalog))
 }
 
 // ============================================================================
@@ -566,6 +601,7 @@ pub async fn handle_responses(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -601,6 +637,7 @@ pub async fn handle_responses(
             &state,
             is_stream,
             connection_guard,
+            codex_tool_context,
         )
         .await;
     }
@@ -641,6 +678,7 @@ pub async fn handle_responses_compact(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -676,6 +714,7 @@ pub async fn handle_responses_compact(
             &state,
             is_stream,
             connection_guard,
+            codex_tool_context,
         )
         .await;
     }
@@ -696,6 +735,7 @@ async fn handle_codex_chat_to_responses_transform(
     state: &ProxyState,
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
+    tool_context: transform_codex_chat::CodexToolContext,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -708,7 +748,7 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
-        let sse_stream = create_responses_sse_stream_from_chat(stream);
+        let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
         let usage_collector = if usage_logging_enabled(state) {
@@ -790,11 +830,14 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] 解析 Chat 上游响应失败: {e}, body: {body_str}");
         ProxyError::TransformError(format!("Failed to parse upstream chat response: {e}"))
     })?;
-    let responses_response = transform_codex_chat::chat_completion_to_response(chat_response)
-        .map_err(|e| {
-            log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
-            e
-        })?;
+    let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
+        chat_response,
+        &tool_context,
+    )
+    .map_err(|e| {
+        log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
+        e
+    })?;
     state
         .codex_chat_history
         .record_response(&responses_response)
